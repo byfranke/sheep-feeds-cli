@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+*.bak
+*~
+.DS_Store
+build/
+dist/
+*.egg-info/
+venv/
+.venv/
+.env
+config.ini
