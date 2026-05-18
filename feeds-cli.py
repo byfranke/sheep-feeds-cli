@@ -99,6 +99,8 @@ WATCH_HITS_DB = WATCH_DIR / "hits.db"
 WATCH_STATE_FILE = WATCH_DIR / "state.json"
 WATCH_MAX_RULES = 50
 WATCH_MAX_SEARCH_BYTES = 4096
+WATCH_REGEX_HAYSTACK_BYTES = 1024
+WATCH_REGEX_TIMEOUT_SECONDS = 2
 WATCH_DEFAULT_INTERVAL = 900
 WATCH_MIN_INTERVAL = 60
 WATCH_MAX_INTERVAL = 6 * 3600
@@ -1161,7 +1163,14 @@ class WatchStore:
             )
             return []
         try:
-            with open(WATCH_RULES_FILE, "r", encoding="utf-8") as f:
+            fd = os.open(str(WATCH_RULES_FILE), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError as e:
+            err_console.print(
+                f"[yellow]Could not open {WATCH_RULES_FILE}: {_safe(str(e))}[/yellow]"
+            )
+            return []
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f)
         except (OSError, yaml.YAMLError) as e:
             err_console.print(
@@ -1186,19 +1195,24 @@ class WatchStore:
             if not isinstance(match, dict) or not isinstance(notify, list):
                 continue
             clean.append({
-                "id": rid,
-                "name": name,
+                "id": rid[:32],
+                "name": name[:64],
                 "enabled": bool(entry.get("enabled", True)),
-                "feed": feed,
+                "feed": feed[:64],
                 "match": {
-                    "severity": match.get("severity"),
-                    "category": match.get("category"),
-                    "contains": match.get("contains"),
-                    "regex": match.get("regex"),
+                    "severity": (match.get("severity") or None) and str(match.get("severity"))[:64],
+                    "category": (match.get("category") or None) and str(match.get("category"))[:128],
+                    "contains": (match.get("contains") or None) and str(match.get("contains"))[:512],
+                    "regex": (match.get("regex") or None) and str(match.get("regex"))[:512],
                 },
-                "notify": [n for n in notify if isinstance(n, (str, dict))],
+                "notify": [
+                    n if isinstance(n, dict) else str(n)[:512]
+                    for n in notify if isinstance(n, (str, dict))
+                ][:8],
                 "created_at": entry.get("created_at"),
             })
+            if len(clean) >= WATCH_MAX_RULES:
+                break
         return clean
 
     def save_rules(self, rules: List[Dict[str, Any]]) -> None:
@@ -1372,7 +1386,11 @@ class WatchStore:
         if not WATCH_STATE_FILE.exists():
             return {}
         try:
-            with open(WATCH_STATE_FILE, "r", encoding="utf-8") as f:
+            fd = os.open(str(WATCH_STATE_FILE), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            return {}
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return data if isinstance(data, dict) else {}
         except (OSError, json.JSONDecodeError):
@@ -1403,13 +1421,75 @@ class WatchStore:
             self._conn = None
 
 
+def _regex_search_with_timeout(
+    pattern: "re.Pattern[str]", text: str, timeout_seconds: int,
+) -> Optional[bool]:
+    """Run ``pattern.search(text)`` aborting after ``timeout_seconds``.
+
+    Returns:
+      - ``True``  / ``False`` when the search finished in time.
+      - ``None``  when the search was aborted (only possible on Unix,
+        where ``signal.SIGALRM`` is available). Callers treat ``None``
+        as "no match" so a runaway regex never blocks the watch loop.
+
+    On platforms without ``SIGALRM`` (Windows) we simply run the search;
+    the ``add`` validator already rejects patterns that take more than
+    ``timeout_seconds`` against an adversarial input, so writers cannot
+    persist a catastrophic regex in the rules file from the supported
+    paths. Manual edits of ``rules.yml`` on Windows remain a footgun.
+    """
+    has_alarm = hasattr(signal, "SIGALRM")
+    if not has_alarm:
+        try:
+            return bool(pattern.search(text))
+        except Exception:
+            return None
+
+    class _RegexTimeout(Exception):
+        pass
+
+    def _handler(signum, frame):
+        raise _RegexTimeout()
+
+    previous = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(max(1, int(timeout_seconds)))
+    try:
+        return bool(pattern.search(text))
+    except _RegexTimeout:
+        return None
+    except Exception:
+        return None
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def _regex_redos_safe(pattern: str) -> bool:
+    """Probe a user-supplied regex with an adversarial input.
+
+    Returns False when the pattern fails to compile OR when running it
+    against a stress haystack (``a`` * 256 + ``!``) takes longer than
+    ``WATCH_REGEX_TIMEOUT_SECONDS``. Used at ``watch add`` time so the
+    bad regex never reaches ``rules.yml`` in the first place.
+    """
+    try:
+        pat = re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        return False
+    stress = "a" * 256 + "!"
+    result = _regex_search_with_timeout(pat, stress, WATCH_REGEX_TIMEOUT_SECONDS)
+    return result is not None
+
+
 def _evaluate_rule(rule: Dict[str, Any], item: Dict[str, Any]) -> bool:
     """Return True when ``item`` matches the rule's ``match`` block.
 
     All match keys are AND-ed: every non-null key must hit. Substring
-    comparisons are case-insensitive. Regex is compiled per call (cheap
-    in CPython's re cache); the input is capped at
-    ``WATCH_MAX_SEARCH_BYTES`` to bound any worst-case backtracking.
+    comparisons are case-insensitive. Regex runs LAST (after the cheap
+    substring/severity/category filters) against a haystack capped to
+    ``WATCH_REGEX_HAYSTACK_BYTES`` and is wrapped in a per-search
+    timeout (``WATCH_REGEX_TIMEOUT_SECONDS``) so a pathological pattern
+    cannot stall the watch loop indefinitely.
     """
     match = rule.get("match") or {}
     item_severity = str(item.get("severity") or "").lower()
@@ -1439,7 +1519,11 @@ def _evaluate_rule(rule: Dict[str, Any], item: Dict[str, Any]) -> bool:
             pat = re.compile(regex, re.IGNORECASE)
         except re.error:
             return False
-        if not pat.search(haystack):
+        small_haystack = haystack[:WATCH_REGEX_HAYSTACK_BYTES]
+        result = _regex_search_with_timeout(
+            pat, small_haystack, WATCH_REGEX_TIMEOUT_SECONDS,
+        )
+        if not result:
             return False
 
     return True
@@ -2001,6 +2085,14 @@ def _dispatch_watch(args: argparse.Namespace, client: "SheepFeedsClient") -> int
             except re.error as e:
                 err_console.print(f"[red]Invalid regex: {_safe(str(e))}[/red]")
                 return 2
+            if not _regex_redos_safe(args.regex):
+                err_console.print(
+                    "[red]This regex is too slow on adversarial input "
+                    f"(>{WATCH_REGEX_TIMEOUT_SECONDS}s). "
+                    "Rewrite it with bounded quantifiers (e.g. avoid nested "
+                    "+, *, ?) or use --contains for a plain substring.[/red]"
+                )
+                return 2
         notify_raw = args.notify or ["desktop"]
         notify: List[Any] = []
         for n in notify_raw:
@@ -2013,6 +2105,20 @@ def _dispatch_watch(args: argparse.Namespace, client: "SheepFeedsClient") -> int
                         f"[red]Invalid webhook URL: {_safe(ns)}[/red]"
                     )
                     return 2
+                parsed = urlparse(ns)
+                host = (parsed.hostname or "").lower()
+                if ns.startswith("http://") and not _is_local_host(host):
+                    err_console.print(
+                        f"[yellow]Webhook over plain HTTP to non-loopback "
+                        f"host: {_safe(host)}. Traffic will be readable in "
+                        f"transit. Prefer https:// when possible.[/yellow]"
+                    )
+                if host in {"169.254.169.254", "metadata.google.internal",
+                            "metadata.azure.com"}:
+                    err_console.print(
+                        f"[yellow]Webhook host {_safe(host)} matches a known "
+                        f"cloud metadata endpoint. Only use if intentional.[/yellow]"
+                    )
                 notify.append({"webhook": ns})
             else:
                 err_console.print(
