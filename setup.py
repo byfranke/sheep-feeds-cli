@@ -206,7 +206,7 @@ class SheepFeedsSetup:
         cta = (
             "[bold]Don't have an API token yet?[/bold]\n\n"
             f"Get one at [cyan]{STORE_URL}[/cyan]\n"
-            "  - Sheep Pro / Pro Max / Enterprise — paid plans, token by email.\n"
+            "  - Sheep Plus / Sheep Pro / Sheep Pro Max — paid plans, token by email.\n"
             "  - Black Sheep gift card — redeem on Discord with /token.\n\n"
             "[dim]Tokens start with 'shp_'. Paste yours below.[/dim]"
         )
