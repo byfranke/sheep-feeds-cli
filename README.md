@@ -104,7 +104,7 @@ non-interactive workflows where typing a master password isn't viable.
 
 ### Where to get a token
 
-- Sheep Pro / Pro Max / Enterprise — sign up at
+- Sheep Plus / Sheep Pro / Sheep Pro Max — sign up at
   [sheep.byfranke.com/pages/store](https://sheep.byfranke.com/pages/store),
   token is emailed to you.
 - Black Sheep gift card — redeem on Discord with `/token`.
